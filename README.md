@@ -185,7 +185,7 @@ make curl-tenant-c
 
 So far, we have not set up a route to Tenant D's backend Service. Note that until now, all `HTTPRoute`s have been created in the same namespaces as the backend which they route to.
 
-Imagine someone with the permission to create `HTTPRoute`s in the `tenant-a` namespace (as in [cross-ns-route.yaml](./cross-ns-route.yaml)) tries to create a route to Tenant D's backend service:
+Imagine someone with the permission to create `HTTPRoute`s in the `tenant-a` namespace (as in [cross-ns-route.yaml](./manifests/cross-ns-route.yaml)) tries to create a route to Tenant D's backend service:
 
 ```bash
 make cross-ns-route-create
