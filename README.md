@@ -86,6 +86,8 @@ spec:
               - tenant-c
 ```
 
+:warning: We can see how a potential risk could occur by looking at this listener. Imagine that instead of the `kubernetes.io/metadata.name` label (which is automatically set to the name of the namespace), we used a custom label. In this case, a malicious internal actor with the ability to label namespaces would be able to change the set of namespaces supported by the Gateway. With some social engineering, users of a legitimate service which uses the shaed gateway could possibly be tricked into sending traffic to a malicious backend. We can look at an example of this once we've set up our backend services for all the tenants.
+
 Create backend services and deployments for Tenants A, B, C and D, noting that we will also create a dedicated Gateway for Tenant A:
 
 ```bash
@@ -125,13 +127,13 @@ apiVersion: gateway.networking.k8s.io/v1beta1
 kind: HTTPRoute
 metadata:
   name: backend
-  namespace: tenant-b
+  namespace: tenant-c
 spec:
   parentRefs:
     - name: eg
       namespace: shared
   hostnames:
-    - "www.tenant-b.example.com"
+    - "www.tenant-c.example.com"
   rules:
     - backendRefs:
         - group: ""
@@ -181,6 +183,22 @@ Curl the Tenant C service:
 make curl-tenant-c
 ```
 
+#### Malicious HTTPRoute Example
+
+:warning: We explored the risk earlier that in the context of the shared gateway topology, a tenant could create a malicious backend and HTTPRoute, and attempt to use social engineering techniques to direct a user of a co-tenant's legitimate service to the malicious backend. Let's consider the case where a threat actor has the ability to create HTTPRoutes in the `tenant-c` namespace:
+
+```bash
+make malicious-httproute
+```
+
+Now let's imagine that this threat actor can trick a user of Tenant B's service to visit `www.tenant-b.example.com/totally-legit`:
+
+```bash
+make curl-tenant-b-malicious
+```
+
+Note that the response is served by the backend pod in `"namespace": "tenant-c"`
+
 ### Exploring ReferenceGrants with Tenant D
 
 So far, we have not set up a route to Tenant D's backend Service. Note that until now, all `HTTPRoute`s have been created in the same namespaces as the backend which they route to.
@@ -207,6 +225,95 @@ Try accessing the Tenant D Service again, and observe that it now works:
 
 ```bash
 make curl-tenant-d
+```
+
+:warning: In this case, if a threat actor with the ability to create a ReferenceGrant in the `tenant-d` namespace wanted to set up an HTTPRoute to a malicious backend, they would need to compromise a service account or set of user credentials which would allow them to create an HTTPRoute in the `tenant-a` namespace.
+
+## Compromised Proxy Scenario
+
+:warning: We have explored what an attacker would need to do in order to create a malicious HTTPRoute. An even more attractive target would be for the attacker to take over an Envoy Proxy, either by exploiting a vulnerability to achieve RCE, or by configuring Envoy Gateway to deploy a proxy using a vulnerable or maliciously crafted image. Let's look at the naive case, whereby a new tenant (Tenant E) simply deploys a malciously crafted Envoy Proxy.
+
+First we will build an image and load it into our kind cluster. Rather than a realistic example, we are simply going to install `tcpdump` on top of an Envoy Proxy base image, and copy in the `tcpdump.sh` script which we can run from within the container to demonstrate the threat:
+
+```bash
+make build-malicious-envoy
+```
+
+Envoy Gateway allows you to customise the Envoy Proxy image as per the documentation [here](https://gateway.envoyproxy.io/v0.5.0/user/customize-envoyproxy/#customize-envoyproxy-image). This can be used to ensure that your image complies with any mandated security standards, but in this case, we are going to use our toy maliciously crafted image.
+
+Let's deploy the Tenant E infrastructure, including the new GatewayClass and EnvoyProxy:
+
+```bash
+make tenant-e-infra-install
+```
+
+Run the `tcpdump.sh` script from within the Envoy Proxy container:
+
+```bash
+make exec-into-proxy-e
+```
+
+Open a new terminal window, set up port forwarding and curl the Tenant E service:
+
+```bash
+make port-forward-tenant-e
+make curl-tenant-e
+```
+
+Switch back to the original terminal window and observe the request that we just sent being captured. An attacker with access to (or malicious code running inside) a proxy may want to send captured traffic to an attacker controlled service, or tamper with traffic in transit.
+
+## Compromised Controller Scenario
+
+:warning: To affect the Confidentiality, Integrity or Availability of user data, an attacker will ultimately need to compromise the data plane (i.e. the Envoy Proxy). This could be carried out by a malicious insider, as shown in the previous section, or by malicious external actors who could, for example:
+
+- :warning: carry out a supply chain attack resulting in a malicious image being run
+- :warning: exploit known vulnerabilities in an unpatched Envoy Proxy
+- :warning: exploit weaknesses in the Kubernetes cluster to move laterally from a compromised pod to an Envoy Pod
+
+:warning: To further explore the consequences of multitenancy, let's consider the most general scenario where we have multiple Gateways in different namespaces within the cluster (each referencing a different GatewayClass), and one of the Gateway pods is compromised (e.g. through one of the above routes). Could our attacker now modify an EnvoyProxy in a different namespace to that of the compromised Envoy Gateway?
+
+Note that in our example, we have not used Envoy Gateway's namespaced mode, so each Envoy Gateway has Kubernetes permissions defined by a ClusterRole. Let's imagine that Tenant A has been compromised, and the attacker wants to modify the Shared Envoy Proxy. Firstly we can look at the Envoy Gateway ClusterRole used by Tenant A's Gateway:
+
+```bash
+kubectl describe clusterrole eg-tenant-a-gateway-helm-envoy-gateway-role | grep envoyproxies
+```
+
+Note that we cannot patch existing envoy proxies, so by using Tenant A's Envoy Gateway Service Account, our attacker will not be able to modify the EnvoyProxy referred to by the Shared GatewayClass. However, note that we can patch GatewayClasses:
+
+```bash
+kubectl describe clusterrole eg-tenant-a-gateway-helm-envoy-gateway-role | grep gatewayclasses
+```
+
+Let's use the `./scripts/perform-action-as-gateway.sh` script to see if we can patch the Shared GatewayClass to use a malicious EnvoyProxy in the `tenant-a` namespace using the Envoy Gateway's Service Account. Firstly we will create the EnvoyProxy (note that this resource cannot be created using the EG Service Account):
+
+```bash
+make create-malicious-proxy
+```
+
+Now we will patch the Shared GatewayClass using the Tenant A Gateway Service Account:
+
+```bash
+make patch-gatewayclass
+```
+
+Let's force the Envoy Gateway and Proxy pods to restart:
+
+```bash
+make restart-shared-pods
+```
+
+Observe that the Envoy image has not changed!
+
+```bash
+make grep-shared-envoy-image
+```
+
+This is by design in Gateway API! As per the [API specification](https://gateway-api.sigs.k8s.io/v1alpha2/references/spec/#gateway.networking.k8s.io/v1alpha2.GatewayClass): "a Gateway is based on the state of the GatewayClass at the time it was created and changes to the GatewayClass or associated parameters are not propagated down to existing Gateways. This recommendation is intended to limit the blast radius of changes to GatewayClass or associated parameters."
+
+:warning: However, we must still be careful with ClusterRoles. For example, we can check that the Tenant A Envoy Gateway can observe secrets across the cluster:
+
+```bash
+./scripts/perform-action-as-gateway.sh kubectl describe secrets -A
 ```
 
 ## Teardown
